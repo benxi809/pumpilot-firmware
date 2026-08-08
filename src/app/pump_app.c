@@ -16,6 +16,8 @@
 #include "adc_battery.h"
 #include "beeper.h"
 #include "ringbuf.h"
+#include "basal_scheduler.h"
+#include "bolus_scheduler.h"
 
 /* 事件队列（ISR→主循环，单生产单消费） */
 #define APP_EVT_Q_SIZE  32u
@@ -63,6 +65,17 @@ void pump_app_init(const factory_info_t *fi)
     /* 6. 事件队列 */
     ringbuf_init(&s_evt_q, s_evt_buf, APP_EVT_Q_SIZE);
 
+    /* 7. 调度器初始化（FW-D2） */
+    bolus_scheduler_init();
+    /* 基础率默认空表（APP 首次绑定/被替换曲线命令时 load） */
+    {
+        float zero[PUMP_BASAL_SEG_COUNT];
+        uint8_t i;
+        for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) zero[i] = 0.0f;
+        basal_scheduler_load(zero);
+        basal_scheduler_reset_delivered();
+    }
+
     /* 出厂信息载入：FIRMWARE 骨架就绪 */
     (void)s_factory;
 }
@@ -72,6 +85,50 @@ void pump_app_event_push(app_event_t ev)
     ringbuf_push(&s_evt_q, (uint8_t)ev);
 }
 
+/* ---- FW-D2 调度辅助 ---- */
+
+/* 基础率 3 分钟槽：读取时钟，计算本槽脉冲并输出 */
+static void pump_app_basal_tick(void)
+{
+    uint16_t mom;
+    uint8_t  seg, slot;
+    uint32_t pulses;
+    rtc_datetime_t now;
+
+    if (!basal_scheduler_loaded() || !basal_scheduler_is_active()) {
+        return;
+    }
+    hal_rtc_get(&now);
+    mom = (uint16_t)(now.hour * 60u + now.minute);
+    pulses = basal_scheduler_pulses_at(mom, &seg, &slot);
+    if (pulses > 0u) {
+        uint32_t done = pwm_motor_pulse_burst(pulses);
+        basal_scheduler_add_delivered_pulses(done);
+    }
+}
+
+/* 大剂量服务：驱动 BolusScheduler 输出脉冲（每次输出一批） */
+static void pump_app_service_bolus(void)
+{
+    uint32_t pulses;
+    bool     final;
+    if (!bolus_scheduler_busy()) {
+        return;
+    }
+    if (pwm_motor_busy()) {
+        return; /* 防叠加：前一批脉冲未输出完，等待 */
+    }
+    if (!bolus_scheduler_poll(&pulses, &final)) {
+        return;
+    }
+    if (pulses > 0u) {
+        uint32_t done = pwm_motor_pulse_burst(pulses);
+        /* 复合切换点 buf 清空后由 poll 内部推进；此处大剂量累计由后续上报 */
+        (void)done;
+        (void)final;
+    }
+}
+
 void pump_app_run(void)
 {
     uint8_t ev;
@@ -79,8 +136,10 @@ void pump_app_run(void)
         if (ringbuf_pop(&s_evt_q, &ev)) {
             switch ((app_event_t)ev) {
             case APP_EV_HALL_FAULT:
-                /* 机械故障：转入一级报警停止 */
+                /* 机械故障：转入一级报警停止，中止大剂量 */
                 state_machine_transit(EV_ALERT_L1);
+                bolus_scheduler_stop(BOLUS_STOP_ALERT_L1);
+                basal_scheduler_pause();
                 break;
             case APP_EV_FILL_WAKE:
                 state_machine_transit(EV_FILL_WAKE);
@@ -94,15 +153,41 @@ void pump_app_run(void)
             case APP_EV_ADC_LOW:
                 beeper_alert(ALERT_LEVEL_2);
                 break;
+            case APP_EV_TIMER_3MIN:
+                /* 基础率 3 分钟槽输注 */
+                pump_app_basal_tick();
+                break;
+            case APP_EV_START_INFUSE:
+                if (state_machine_transit(EV_START_INFUSE)) {
+                    basal_scheduler_start();
+                }
+                break;
+            case APP_EV_PAUSE:
+                if (state_machine_transit(EV_PAUSE)) {
+                    basal_scheduler_pause();
+                    bolus_scheduler_stop(BOLUS_STOP_USER);
+                }
+                break;
+            case APP_EV_RESUME:
+                if (state_machine_transit(EV_RESUME)) {
+                    basal_scheduler_resume();
+                }
+                break;
+            case APP_EV_ABANDON:
+                if (state_machine_transit(EV_ABANDON)) {
+                    basal_scheduler_pause();
+                    bolus_scheduler_stop(BOLUS_STOP_USER);
+                }
+                break;
             default:
-                /* 计时器/对时/低功耗等由 FW-D2/D4 处理 */
+                /* 对时/低功耗等由后续阶段处理 */
                 break;
             }
         } else {
-            /* 低频轮询：电池/蜂鸣 */
+            /* 低频轮询：电池/蜂鸣 + 大剂量服务 */
             adc_battery_poll();
             beeper_tick(50u);
-            /* 低功耗调度由 FW-D4 实现 */
+            pump_app_service_bolus();
         }
     }
 }

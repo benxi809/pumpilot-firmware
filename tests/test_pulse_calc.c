@@ -11,6 +11,8 @@
 #include "crc16.h"
 #include "ringbuf.h"
 #include "pump_state.h"
+#include "basal_scheduler.h"
+#include "bolus_scheduler.h"
 #include "algo_params.h"
 
 static int g_fail = 0;
@@ -125,6 +127,123 @@ static void test_ringbuf(void)
     }
 }
 
+/* ================= FW-D2：基础率调度测试 ================= */
+static void test_basal_scheduler(void)
+{
+    printf("[BasalScheduler]\n");
+    float table[PUMP_BASAL_SEG_COUNT];
+    uint32_t i, total, sum = 0, maxdiff = 0;
+    basal_scheduler_load(table); /* 全 0 */
+
+    /* 载入：全部 1.0 IU/h */
+    for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) table[i] = 1.0f;
+    basal_scheduler_load(table);
+    CHECK(basal_scheduler_loaded(), "loaded");
+    CHECK(basal_scheduler_get_seg_rate(0) == 1.0f, "seg0 rate 1.0");
+    /* 1.0 IU/h 段总脉冲 = floor(1.0*0.5/0.00339)=147 */
+    CHECK(basal_scheduler_seg_pulses(0) == 147u, "seg0 total pulses 147");
+
+    /* Bresenham 匀距：10 槽和 = 总脉冲，各槽差 ≤1 */
+    total = basal_scheduler_seg_pulses(0);
+    for (i = 0; i < BASAL_SLOTS_PER_SEG; ++i) {
+        uint32_t p = basal_scheduler_slot_pulses(0, (uint8_t)i);
+        sum += p;
+    }
+    CHECK(sum == total, "10 slots sum == seg total");
+    for (i = 1; i < BASAL_SLOTS_PER_SEG; ++i) {
+        uint32_t a = basal_scheduler_slot_pulses(0, (uint8_t)(i - 1));
+        uint32_t b = basal_scheduler_slot_pulses(0, (uint8_t)i);
+        uint32_t d = (a > b) ? (a - b) : (b - a);
+        if (d > maxdiff) maxdiff = d;
+    }
+    CHECK(maxdiff <= 1u, "slot pulse diff <=1 (uniform)");
+
+    /* pulses_at：分钟定位 */
+    {
+        uint8_t seg, slot;
+        uint32_t p = basal_scheduler_pulses_at(0, &seg, &slot);  /* 00:00, seg0 slot0 */
+        CHECK(seg == 0 && slot == 0, "00:00 -> seg0 slot0");
+        p = basal_scheduler_pulses_at(90, &seg, &slot);          /* 01:30 -> seg3 slot0 */
+        CHECK(seg == 3 && slot == 0, "01:30 -> seg3 slot0");
+        p = basal_scheduler_pulses_at(95, &seg, &slot);          /* 01:35 -> seg3 slot1(5/3) */
+        CHECK(seg == 3 && slot == 1u, "01:35 -> seg3 slot1");
+        (void)p;
+    }
+
+    /* 启停激活 */
+    basal_scheduler_start();
+    CHECK(basal_scheduler_is_active(), "start -> active");
+    basal_scheduler_pause();
+    CHECK(!basal_scheduler_is_active(), "pause -> inactive");
+    basal_scheduler_resume();
+    CHECK(basal_scheduler_is_active(), "resume -> active");
+}
+
+/* ================= FW-D2：大剂量调度测试 ================= */
+static void test_bolus_scheduler(void)
+{
+    printf("[BolusScheduler]\n");
+    bolus_scheduler_init();
+
+    /* 快速大剂量：2.5 IU 一次输出 737 脉冲 */
+    {
+        bolus_spec_t sp = { 100u, BOLUS_FAST, 2.5f, 0u, 0u };
+        uint32_t pulses; bool final = false;
+        CHECK(bolus_scheduler_start(&sp), "fast start accepted");
+        CHECK(bolus_scheduler_busy(), "busy while running");
+        CHECK(bolus_scheduler_poll(&pulses, &final), "fast poll has output");
+        CHECK(pulses == 737u, "fast 2.5IU -> 737 pulses");
+        CHECK(bolus_scheduler_state() == BOLUS_IDLE, "fast completes -> IDLE");
+    }
+
+    /* 幂等：同 op_id 重复 → 拒绝 */
+    {
+        bolus_spec_t sp = { 100u, BOLUS_FAST, 1.0f, 0u, 0u };
+        CHECK(!bolus_scheduler_start(&sp), "duplicate op_id rejected (idempotent)");
+    }
+    /* 不同 op_id 可执行 */
+    {
+        bolus_spec_t sp = { 101u, BOLUS_FAST, 1.0f, 0u, 0u };
+        uint32_t pulses; bool final;
+        CHECK(bolus_scheduler_start(&sp), "new op_id accepted");
+        bolus_scheduler_poll(&pulses, &final);
+        (void)pulses; (void)final;
+    }
+
+    /* 扩展大剂量：1.0 IU/60min → 每3分钟槽(20槽) 匀距，总和=295 */
+    {
+        bolus_spec_t sp = { 200u, BOLUS_EXT, 1.0f, 60u, 0u };
+        uint32_t pulses, total = 0, slots = 0; bool final;
+        bolus_scheduler_init();
+        CHECK(bolus_scheduler_start(&sp), "ext start");
+        while (bolus_scheduler_busy()) {
+            if (bolus_scheduler_poll(&pulses, &final)) {
+                total += pulses; slots++;
+            } else break;
+        }
+        CHECK(total == 295u, "ext total pulses 295");
+        /* 60min/3min = 20 slots */
+        (void)slots;
+    }
+
+    /* 复合大剂量：2.0 IU, 50% → 前半295 + 后半295，两次阶段 */
+    {
+        bolus_spec_t sp = { 300u, BOLUS_DUAL, 2.0f, 60u, 50u };
+        uint32_t pulses, a = 0, b = 0; bool final;
+        bolus_scheduler_init();
+        CHECK(bolus_scheduler_start(&sp), "dual start");
+        /* 第一次 poll：bolus 部分 295 */
+        CHECK(bolus_scheduler_poll(&pulses, &final) && pulses == 295u, "dual bolus part 295");
+        a = pulses;
+        /* 之后推进扩展部分，累计到总完成 */
+        while (bolus_scheduler_busy()) {
+            if (bolus_scheduler_poll(&pulses, &final)) b += pulses;
+            else break;
+        }
+        CHECK(a == 295u && b == 295u, "dual bolus 295 + ext 295");
+    }
+}
+
 int main(void)
 {
     printf("=== Pumpilot FW-D1 host tests ===\n");
@@ -133,6 +252,8 @@ int main(void)
     test_reservoir();
     test_state_machine();
     test_ringbuf();
+    test_basal_scheduler();
+    test_bolus_scheduler();
     if (g_fail == 0) {
         printf("\nALL TESTS PASSED\n");
         return 0;

@@ -15,15 +15,19 @@ extern "C" {
 
 /** 应用事件（ISR 可投递） */
 typedef enum {
-    APP_EV_FILL_WAKE   = 1,  /* 灌注唤醒中断 */
-    APP_EV_HALL_RISE   = 2,  /* 霍尔上升沿（转子转动） */
-    APP_EV_PIN_IN      = 3,  /* 针到位 K65 */
-    APP_EV_LOCK        = 4,  /* 丝杆锁止 K66 */
-    APP_EV_TIMER_3MIN  = 5,  /* 基础率 3 分钟槽 */
-    APP_EV_TIMER_1H    = 6,  /* 对时 1 小时 */
-    APP_EV_TIMER_LPM   = 7,  /* 低功耗唤醒窗口 */
-    APP_EV_HALL_FAULT  = 8,  /* 机械故障 */
-    APP_EV_ADC_LOW     = 9   /* 电量低 */
+    APP_EV_FILL_WAKE    = 1,   /* 灌注唤醒中断 */
+    APP_EV_HALL_RISE    = 2,   /* 霍尔上升沿（转子转动） */
+    APP_EV_PIN_IN       = 3,   /* 针到位 K65 */
+    APP_EV_LOCK         = 4,   /* 丝杆锁止 K66 */
+    APP_EV_TIMER_3MIN   = 5,   /* 基础率 3 分钟槽 */
+    APP_EV_TIMER_1H     = 6,   /* 对时 1 小时 */
+    APP_EV_TIMER_LPM    = 7,   /* 低功耗唤醒窗口 */
+    APP_EV_HALL_FAULT   = 8,   /* 机械故障 */
+    APP_EV_ADC_LOW      = 9,   /* 电量低 */
+    APP_EV_START_INFUSE = 10,  /* 开始输注(START) */
+    APP_EV_PAUSE        = 11,  /* 暂停 */
+    APP_EV_RESUME       = 12,  /* 恢复 */
+    APP_EV_ABANDON      = 13   /* 废止 */
 } app_event_t;
 
 /**
