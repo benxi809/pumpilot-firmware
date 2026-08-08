@@ -18,6 +18,8 @@
 #include "ringbuf.h"
 #include "basal_scheduler.h"
 #include "bolus_scheduler.h"
+#include "ieee11073.h"
+#include "ble_service.h"
 
 /* 事件队列（ISR→主循环，单生产单消费） */
 #define APP_EVT_Q_SIZE  32u
@@ -25,6 +27,9 @@ static uint8_t          s_evt_buf[APP_EVT_Q_SIZE];
 static ringbuf_t        s_evt_q;
 
 static factory_info_t   s_factory;
+
+/* forward decl（pump_app_init 中使用） */
+static void ble_on_write(const uint8_t *data, uint16_t len);
 
 static void on_hall_fault(void)
 {
@@ -76,6 +81,10 @@ void pump_app_init(const factory_info_t *fi)
         basal_scheduler_reset_delivered();
     }
 
+    /* 8. IEEE11073 agent + BLE 服务（FW-D3） */
+    ieee11073_init();
+    ble_service_init(ble_on_write, 0);
+
     /* 出厂信息载入：FIRMWARE 骨架就绪 */
     (void)s_factory;
 }
@@ -86,6 +95,24 @@ void pump_app_event_push(app_event_t ev)
 }
 
 /* ---- FW-D2 调度辅助 ---- */
+
+/* BLE 2A20 写入回调：数据交由 IEEE11073 agent 处理 */
+static void ble_on_write(const uint8_t *data, uint16_t len)
+{
+    ieee11073_on_data(data, len);
+}
+
+/* 将 IEEE11073 待上报帧经 BLE notify 发出 */
+static void pump_app_flush_reports(void)
+{
+    uint8_t f[IEEE11073_FRAME_MAX];
+    uint16_t fl;
+    if (ieee11073_has_pending()) {
+        if (ieee11073_get_pending(f, &fl)) {
+            ble_service_notify(f, fl);
+        }
+    }
+}
 
 /* 基础率 3 分钟槽：读取时钟，计算本槽脉冲并输出 */
 static void pump_app_basal_tick(void)
@@ -184,10 +211,11 @@ void pump_app_run(void)
                 break;
             }
         } else {
-            /* 低频轮询：电池/蜂鸣 + 大剂量服务 */
+            /* 低频轮询：电池/蜂鸣 + 大剂量服务 + 上报刷新 */
             adc_battery_poll();
             beeper_tick(50u);
             pump_app_service_bolus();
+            pump_app_flush_reports();
         }
     }
 }

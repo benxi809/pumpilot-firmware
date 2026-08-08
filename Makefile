@@ -20,6 +20,7 @@ TEST_SRCS := \
     src/app/pump_state.c \
     src/services/basal_scheduler.c \
     src/services/bolus_scheduler.c \
+    src/services/ieee11073.c \
     src/drivers/pwm_motor.c \
     src/drivers/hall_sensor.c \
     src/drivers/grid_scan.c \

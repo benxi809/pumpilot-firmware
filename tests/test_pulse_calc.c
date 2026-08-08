@@ -13,6 +13,7 @@
 #include "pump_state.h"
 #include "basal_scheduler.h"
 #include "bolus_scheduler.h"
+#include "ieee11073.h"
 #include "algo_params.h"
 
 static int g_fail = 0;
@@ -244,6 +245,110 @@ static void test_bolus_scheduler(void)
     }
 }
 
+/* ============ FW-D3：IEEE11073 agent 测试 ============ */
+/* 构造一条命令帧（CMD|op_id|len|payload|CRC，小端） */
+static uint16_t build_cmd(uint8_t *buf, uint8_t cmd, uint32_t op_id,
+                          const uint8_t *payload, uint16_t plen)
+{
+    uint16_t i;
+    buf[0] = cmd;
+    buf[1] = (uint8_t)op_id; buf[2] = (uint8_t)(op_id >> 8);
+    buf[3] = (uint8_t)(op_id >> 16); buf[4] = (uint8_t)(op_id >> 24);
+    buf[5] = (uint8_t)plen; buf[6] = (uint8_t)(plen >> 8);
+    for (i = 0; i < plen; ++i) buf[7 + i] = payload[i];
+    {
+        uint16_t crc = crc16_ccitt(buf, 7 + plen);
+        buf[7 + plen] = (uint8_t)crc;
+        buf[8 + plen] = (uint8_t)(crc >> 8);
+    }
+    return (uint16_t)(7 + plen + 2);
+}
+
+static void test_ieee11073(void)
+{
+    printf("[IEEE11073]\n");
+    ieee11073_init();
+
+    /* 上报帧构建 + CRC 校验 */
+    {
+        uint8_t f[IEEE11073_FRAME_MAX];
+        int n = ieee11073_build_report(RPT_STATUS, (const uint8_t[]){3, 0xE8, 0x07}, 3, f);
+        CHECK(n == 10, "RPT frame len 10 (7 hdr + 3 pl + 2 crc)");
+        CHECK(f[0] == RPT_STATUS, "RPT type 0x81");
+        /* 校验整帧 CRC（不含 CRC 两字节） */
+        {
+            uint16_t len = (uint16_t)(n - 2);
+            uint16_t crc = crc16_ccitt(f, len);
+            uint16_t crcRd = (uint16_t)(f[len] | (f[len+1] << 8));
+            CHECK(crc == crcRd, "RPT frame CRC valid");
+        }
+    }
+
+    /* CMD_SET_TIME 命令：构造并分发 → 返回0 */
+    {
+        uint8_t b[32];
+        uint16_t n = build_cmd(b, CMD_SET_TIME, 0x01, (const uint8_t[]){0}, 0);
+        CHECK(ieee11073_on_data(b, n) == 0, "CMD_SET_TIME accepted");
+        CHECK(ieee11073_has_pending(), "result pending");
+        /* 取出 RPT_RESULT */
+        uint8_t out[256]; uint16_t ol;
+        CHECK(ieee11073_get_pending(out, &ol), "get pending");
+        CHECK(ol == 12 && out[0] == RPT_RESULT, "result frame 0x87 len 12");
+    }
+
+    /* 错误 CRC → 拒绝 */
+    {
+        uint8_t b[32];
+        uint16_t n = build_cmd(b, CMD_SET_TIME, 0x02, (const uint8_t[]){0}, 0);
+        b[n-1] ^= 0xFF; /* 破坏 CRC */
+        CHECK(ieee11073_on_data(b, n) == CMD_RESULT_CRC_ERROR, "bad CRC rejected");
+    }
+
+    /* CMD_DELIVER_BOLUS → 启动大剂量；幂等拒绝重复 op_id */
+    {
+        uint8_t pl[8];
+        uint8_t b[32];
+        uint16_t n;
+        bolus_scheduler_init();
+        ieee11073_init(); /* 清 pending + 幂等历史 */
+        /* payload: type(1)+dose(4)+ext(2)+ratio(1) = 8 */
+        pl[0] = 0; /* fast */
+        /* dose 1.0 IU = 0x3F800000 小端 */
+        pl[1]=0; pl[2]=0; pl[3]=0x80; pl[4]=0x3F;
+        pl[5]=0; pl[6]=0; /* ext 0 */
+        pl[7]=0; /* ratio 0 */
+        n = build_cmd(b, CMD_DELIVER_BOLUS, 0x10, pl, 8);
+        /* 第一次：启动 */
+        CHECK(ieee11073_on_data(b, n) == 0, "first DELIVER_BOLUS accepted");
+        CHECK(bolus_scheduler_busy(), "DELIVER_BOLUS -> bolus running");
+        /* 幂等：同 op_id 重发 → 返回 OPID_DUP，不重启 */
+        CHECK(ieee11073_on_data(b, n) == CMD_RESULT_OPID_DUP,
+              "dup op_id -> OPID_DUP (idempotent)");
+    }
+
+    /* CMD_SET_BASAL：下发 48 段 */
+    {
+        uint8_t pl[48*4];
+        uint8_t b[256];
+        uint16_t i, n;
+        float t[PUMP_BASAL_SEG_COUNT];
+        for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) t[i] = 1.0f;
+        for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) {
+            memcpy(pl + i*4, &t[i], 4); /* 本机 little-endian */
+        }
+        n = build_cmd(b, CMD_SET_BASAL, 0x20, pl, sizeof pl);
+        CHECK(ieee11073_on_data(b, n) == 0, "CMD_SET_BASAL accepted");
+        CHECK(basal_scheduler_get_seg_rate(0) == 1.0f, "basal table loaded via BLE");
+    }
+
+    /* 鉴权绑定 */
+    ieee11073_init();
+    CHECK(!ieee11073_is_bound(), "not bound initially");
+    CHECK(!ieee11073_auth_bind_pwd((const uint8_t*)"", 0), "empty pwd rejected");
+    CHECK(ieee11073_auth_bind_pwd((const uint8_t*)"123456", 6), "pwd accepted");
+    CHECK(ieee11073_is_bound(), "bound after auth");
+}
+
 int main(void)
 {
     printf("=== Pumpilot FW-D1 host tests ===\n");
@@ -254,6 +359,7 @@ int main(void)
     test_ringbuf();
     test_basal_scheduler();
     test_bolus_scheduler();
+    test_ieee11073();
     if (g_fail == 0) {
         printf("\nALL TESTS PASSED\n");
         return 0;
