@@ -21,6 +21,11 @@ TEST_SRCS := \
     src/services/basal_scheduler.c \
     src/services/bolus_scheduler.c \
     src/services/ieee11073.c \
+    src/services/alarm_engine.c \
+    src/services/alarm_app.c \
+    src/services/device_info.c \
+    src/services/log_manager.c \
+    src/services/power_mgr.c \
     src/drivers/pwm_motor.c \
     src/drivers/hall_sensor.c \
     src/drivers/grid_scan.c \

@@ -14,6 +14,11 @@
 #include "basal_scheduler.h"
 #include "bolus_scheduler.h"
 #include "ieee11073.h"
+#include "alarm_engine.h"
+#include "alarm_app.h"
+#include "device_info.h"
+#include "log_manager.h"
+#include "power_mgr.h"
 #include "algo_params.h"
 
 static int g_fail = 0;
@@ -132,9 +137,8 @@ static void test_ringbuf(void)
 static void test_basal_scheduler(void)
 {
     printf("[BasalScheduler]\n");
-    float table[PUMP_BASAL_SEG_COUNT];
+    float table[PUMP_BASAL_SEG_COUNT] = {0}; /* 先载全 0 */
     uint32_t i, total, sum = 0, maxdiff = 0;
-    basal_scheduler_load(table); /* 全 0 */
 
     /* 载入：全部 1.0 IU/h */
     for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) table[i] = 1.0f;
@@ -349,6 +353,170 @@ static void test_ieee11073(void)
     CHECK(ieee11073_is_bound(), "bound after auth");
 }
 
+/* ================= FW-D4：报警 / 出厂信息 / 日志 / 低功耗 ================= */
+
+static void test_alarm_engine(void)
+{
+    printf("[FW-D4 AlarmEngine]\n");
+    alarm_engine_init();
+
+    /* 初始无报警 */
+    CHECK(alarm_engine_get_active() == 0, "no alarm initially");
+    CHECK(alarm_engine_active_count() == 0, "count 0");
+
+    /* 巡检：堵塞置一级 */
+    alarm_input_t in = {0};
+    in.occlusion = true;
+    alarm_engine_check(&in);
+    CHECK(alarm_engine_is_active(ALARM_BIT_OCLUSION), "occlusion active");
+    CHECK(alarm_engine_level(ALARM_BIT_OCLUSION) == ALERT_LEVEL_1, "occlusion lvl1");
+    CHECK(alarm_engine_take_new(), "new-alarm flag set");
+
+    /* 消费后不再重复标记（同状态不变） */
+    CHECK(!alarm_engine_take_new(), "no new alarm after consume");
+
+    /* 电池耗尽一级 / 电量低二级 */
+    alarm_input_t in2 = {0};
+    in2.occlusion = true;
+    in2.batt_low  = true;
+    in2.batt_dead = false;
+    alarm_engine_check(&in2);
+    CHECK(alarm_engine_is_active(ALARM_BIT_BATT_LOW), "batt_low active");
+    CHECK(alarm_engine_level(ALARM_BIT_BATT_LOW) == ALERT_LEVEL_2, "batt_low lvl2");
+
+    /* 三级失联 */
+    alarm_input_t in3 = {0};
+    in3.occlusion = false;
+    in3.batt_low  = false;
+    in3.lost      = true;
+    alarm_engine_check(&in3);
+    CHECK(alarm_engine_is_active(ALARM_BIT_LOST), "lost active");
+    CHECK(alarm_engine_level(ALARM_BIT_LOST) == ALERT_LEVEL_3, "lost lvl3");
+    CHECK(!alarm_engine_is_active(ALARM_BIT_OCLUSION), "occlusion cleared");
+    CHECK(alarm_engine_take_new(), "lost is new alarm");
+
+    /* 清除 */
+    alarm_engine_clear(ALARM_BIT_LOST);
+    CHECK(!alarm_engine_is_active(ALARM_BIT_LOST), "lost cleared");
+    CHECK(alarm_engine_active_count() == 0, "count 0 after clear");
+}
+
+/* alarm_app 蜂鸣驱动记录 */
+static int g_beep_level = 0;
+static int g_beep_active = 0;
+static int g_report_mask = 0;
+static int g_report_level = 0;
+static int g_report_count = 0;
+static void mock_beeper(alert_level_t lvl, bool active)
+{
+    g_beep_level = lvl;
+    g_beep_active = active ? 1 : 0;
+}
+static void mock_report(uint16_t mask, alert_level_t lvl)
+{
+    g_report_mask = mask;
+    g_report_level = lvl;
+    g_report_count++;
+}
+
+static void test_alarm_app(void)
+{
+    printf("[FW-D4 AlarmApp]\n");
+    alarm_app_config_t cfg = { mock_beeper, mock_report };
+    alarm_app_init(&cfg);
+    alarm_engine_init();
+
+    /* 无报警：蜂鸣关闭 */
+    alarm_app_tick();
+    CHECK(g_beep_active == 0, "no alarm → beeper off");
+
+    /* 一级：持续鸣叫 */
+    alarm_input_t in = {0};
+    in.occlusion = true;
+    alarm_engine_check(&in);
+    alarm_app_report_now();
+    CHECK(g_report_count == 1, "report triggered on alarm");
+    CHECK(g_report_level == ALERT_LEVEL_1, "report level 1");
+    alarm_app_tick();
+    CHECK(g_beep_active == 1, "lvl1 → beeper continuous on");
+
+    /* 清除一级并设三级 */
+    alarm_input_t in3 = {0};
+    in3.lost = true;
+    alarm_engine_check(&in3);
+    alarm_app_tick();
+    CHECK(g_beep_active == 1, "lvl3 beeps on");
+}
+
+static void test_device_info(void)
+{
+    printf("[FW-D4 DeviceInfo]\n");
+    factory_info_t fi = {
+        .model = "PLT1", .serial = "PL00000001", .bt_password = "654321",
+        .prod_batch = "20260801AB", .expiry = "20290801", .factory = "SH",
+        .mech_model = "M2Y", .mech_vendor = "V02", .mech_batch = "MB000002",
+        .pcb_model = "PCB0002", .pcb_vendor = "P02", .pcb_batch = "PB000002",
+        .mcu_model = "nRF52832", .mcu_id = "FICR-ABCDEF01", .fw_version = "1.4.0",
+    };
+    device_info_init(&fi);
+    const factory_info_t *got = device_info_get();
+    CHECK(strcmp(got->serial, "PL00000001") == 0, "serial readback");
+    CHECK(strcmp(got->fw_version, "1.4.0") == 0, "fw version readback");
+
+    uint8_t buf[200];
+    uint16_t n = device_info_export(buf, sizeof(buf));
+    CHECK(n > 100, "factory export non empty");
+    /* 魔数校验：字段按序紧贴，起始即 model */
+    CHECK(memcmp(buf, "PLT1", 4) == 0, "export starts with model");
+    /* serial=固定偏移 5 */
+    CHECK(memcmp(buf + 5, "PL00000001", 10) == 0, "export serial offset");
+}
+
+static void test_log_manager(void)
+{
+    printf("[FW-D4 LogManager]\n");
+    log_manager_init();
+    CHECK(log_manager_count() == 0, "log empty init");
+
+    log_manager_append(1000, 0x01, 5);
+    log_manager_append(1001, 0x02, 6);
+    CHECK(log_manager_count() == 2, "log append 2");
+
+    uint8_t buf[100];
+    uint16_t n = log_manager_export(buf, sizeof(buf));
+    CHECK(n == 2 + 2 * 8, "export size 18");
+    CHECK(buf[0] == 2 && buf[1] == 0, "pkg count 2");
+    /* 第一条 ts=1000 */
+    CHECK(buf[2] == 0xE8 && buf[3] == 0x03, "first ts=1000");
+
+    /* 环形覆盖：填 256+5 条 */
+    for (uint32_t i = 0; i < LOG_CAPACITY + 5; i++)
+        log_manager_append((uint32_t)(2000 + i), 0x03, (uint16_t)i);
+    CHECK(log_manager_count() == LOG_CAPACITY, "log capped");
+    /* 最旧被覆盖：导出起始 ts=2005 */
+    uint8_t buf2[3000];
+    uint16_t n2 = log_manager_export(buf2, sizeof(buf2));
+    CHECK(n2 == 2 + LOG_CAPACITY * 8, "full export after ring full");
+    uint32_t first_ts = buf2[2] | (buf2[3] << 8) | (buf2[4] << 16) | ((uint32_t)buf2[5] << 24);
+    CHECK(first_ts == 2005, "ring overwrite oldest");
+}
+
+static void test_power_mgr(void)
+{
+    printf("[FW-D4 PowerMgr]\n");
+    power_mgr_init(PWR_MODE_REGULAR);
+    CHECK(power_mgr_mode() == PWR_MODE_REGULAR, "regular mode");
+    CHECK(power_mgr_allow_sleep(), "allow sleep in regular");
+
+    power_mgr_enter_deep_sleep();
+    CHECK(power_mgr_mode() == PWR_MODE_DEEP_SLEEP, "deep sleep entered");
+
+    pwr_wake_src_t src = power_mgr_event_wake();
+    CHECK(src == PWR_WAKE_GPIO, "woke by gpio");
+    CHECK(power_mgr_mode() == PWR_MODE_REGULAR, "back to regular after wake");
+    CHECK(power_mgr_sleep_count() == 1, "sleep counted once");
+}
+
 int main(void)
 {
     printf("=== Pumpilot FW-D1 host tests ===\n");
@@ -360,6 +528,11 @@ int main(void)
     test_basal_scheduler();
     test_bolus_scheduler();
     test_ieee11073();
+    test_alarm_engine();
+    test_alarm_app();
+    test_device_info();
+    test_log_manager();
+    test_power_mgr();
     if (g_fail == 0) {
         printf("\nALL TESTS PASSED\n");
         return 0;

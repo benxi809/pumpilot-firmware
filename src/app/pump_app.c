@@ -20,6 +20,11 @@
 #include "bolus_scheduler.h"
 #include "ieee11073.h"
 #include "ble_service.h"
+#include "alarm_engine.h"
+#include "alarm_app.h"
+#include "device_info.h"
+#include "log_manager.h"
+#include "power_mgr.h"
 
 /* 事件队列（ISR→主循环，单生产单消费） */
 #define APP_EVT_Q_SIZE  32u
@@ -36,6 +41,27 @@ static void on_hall_fault(void)
     /* 机械故障 → 一级报警事件 */
     beeper_alert(ALERT_LEVEL_1);
     pump_app_event_push(APP_EV_HALL_FAULT);
+}
+
+/* ---- FW-D4 报警桥接 ---- */
+/* 报警上报：RPT_ALERT(0x84)，payload = mask(2 LE) + level(1) */
+static void on_alarm_report(uint16_t mask, alert_level_t level)
+{
+    uint8_t pl[3];
+    pl[0] = (uint8_t)(mask & 0xFF);
+    pl[1] = (uint8_t)((mask >> 8) & 0xFF);
+    pl[2] = (uint8_t)level;
+    uint8_t f[IEEE11073_FRAME_MAX];
+    int n = ieee11073_build_report(RPT_ALERT, pl, sizeof(pl), f);
+    if (n > 0)
+        ble_service_notify(f, (uint16_t)n);
+}
+
+/* 报警蜂鸣：映射到 beeper 驱动 (active=true→alert, false→stop) */
+static void on_alarm_beeper(alert_level_t level, bool active)
+{
+    if (active) beeper_alert(level);
+    else        beeper_stop();
 }
 
 void pump_app_init(const factory_info_t *fi)
@@ -86,7 +112,21 @@ void pump_app_init(const factory_info_t *fi)
     ble_service_init(ble_on_write, 0);
 
     /* 出厂信息载入：FIRMWARE 骨架就绪 */
-    (void)s_factory;
+    if (!hal_flash_read_factory(&s_factory)) {
+        /* 出厂信息缺失时保留外部注入；仍空则用默认 */
+    }
+
+    /* 9. FW-D4：报警 / 出厂信息 / 日志 / 低功耗 */
+    alarm_engine_init();
+    {
+        alarm_app_config_t acfg;
+        acfg.beeper = on_alarm_beeper;
+        acfg.report = on_alarm_report;
+        alarm_app_init(&acfg);
+    }
+    device_info_init(&s_factory);
+    log_manager_init();
+    power_mgr_init(PWR_MODE_REGULAR);
 }
 
 void pump_app_event_push(app_event_t ev)
@@ -211,9 +251,10 @@ void pump_app_run(void)
                 break;
             }
         } else {
-            /* 低频轮询：电池/蜂鸣 + 大剂量服务 + 上报刷新 */
+            /* 低频轮询：电池/蜂鸣/报警 + 大剂量服务 + 上报刷新 */
             adc_battery_poll();
             beeper_tick(50u);
+            alarm_app_tick();           /* 分级报警蜂鸣驱动（FW-D4） */
             pump_app_service_bolus();
             pump_app_flush_reports();
         }
