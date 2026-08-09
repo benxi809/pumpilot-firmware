@@ -40,6 +40,14 @@ void pump_app_init(const factory_info_t *fi);
 /** 主循环：处理事件队列（含低功耗调度） */
 void pump_app_run(void);
 
+/**
+ * @brief 处理一次事件队列 + 低频轮询（非阻塞，单步）。
+ *
+ * host 由 pump_app_run() 的 for(;;) 调用；SoftDevice 构建由 main_sdk.c
+ * 在 sd_app_evt_wait 循环中调用（与 SoftDevice 事件处理交替）。
+ */
+void pump_app_process_once(void);
+
 /** 投递事件（ISR 上下文安全，简单队列） */
 void pump_app_event_push(app_event_t ev);
 

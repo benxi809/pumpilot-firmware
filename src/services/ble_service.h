@@ -69,6 +69,21 @@ void ble_service_set_bound(bool bound);
 void ble_service_set_directed(bool directed);
 
 /**
+ * @brief 设置定向广播目标（绑定 peer 地址，6字节）。
+ * @param addr peer BLE 地址；NULL 清除。
+ */
+void ble_service_set_target(const uint8_t addr[6]);
+
+/** 读取定向广播目标（内部指针） */
+const uint8_t *ble_service_get_target(void);
+
+/** 读取定向广播使能标志 */
+bool ble_service_directed_enabled(void);
+
+/** 2A20 Data 特征句柄（SoftDevice 构建用） */
+uint16_t ble_service_data_handle(void);
+
+/**
  * @brief 经 2A20 写入回调分发（BLE 栈调用；host 测试可直接调用验证）。
  */
 void ble_service_dispatch_write(const uint8_t *data, uint16_t len);

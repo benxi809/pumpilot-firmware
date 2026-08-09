@@ -196,67 +196,78 @@ static void pump_app_service_bolus(void)
     }
 }
 
-void pump_app_run(void)
+/**
+ * @brief 处理一次事件队列 + 低频轮询（非阻塞）。
+ *
+ * host 构建：由 pump_app_run() 的 for(;;) 反复调用；
+ * SoftDevice 构建：由 main_sdk.c 在 sd_app_evt_wait 循环中调用。
+ * 处理完一个事件（或无可处理时做一次低频轮询）即返回，供外部调度。
+ */
+void pump_app_process_once(void)
 {
     uint8_t ev;
-    for (;;) {
-        if (ringbuf_pop(&s_evt_q, &ev)) {
-            switch ((app_event_t)ev) {
-            case APP_EV_HALL_FAULT:
-                /* 机械故障：转入一级报警停止，中止大剂量 */
-                state_machine_transit(EV_ALERT_L1);
-                bolus_scheduler_stop(BOLUS_STOP_ALERT_L1);
-                basal_scheduler_pause();
-                break;
-            case APP_EV_FILL_WAKE:
-                state_machine_transit(EV_FILL_WAKE);
-                break;
-            case APP_EV_PIN_IN:
-                state_machine_transit(EV_APPLY_START);
-                break;
-            case APP_EV_LOCK:
-                state_machine_transit(EV_LOCK_DONE);
-                break;
-            case APP_EV_ADC_LOW:
-                beeper_alert(ALERT_LEVEL_2);
-                break;
-            case APP_EV_TIMER_3MIN:
-                /* 基础率 3 分钟槽输注 */
-                pump_app_basal_tick();
-                break;
-            case APP_EV_START_INFUSE:
-                if (state_machine_transit(EV_START_INFUSE)) {
-                    basal_scheduler_start();
-                }
-                break;
-            case APP_EV_PAUSE:
-                if (state_machine_transit(EV_PAUSE)) {
-                    basal_scheduler_pause();
-                    bolus_scheduler_stop(BOLUS_STOP_USER);
-                }
-                break;
-            case APP_EV_RESUME:
-                if (state_machine_transit(EV_RESUME)) {
-                    basal_scheduler_resume();
-                }
-                break;
-            case APP_EV_ABANDON:
-                if (state_machine_transit(EV_ABANDON)) {
-                    basal_scheduler_pause();
-                    bolus_scheduler_stop(BOLUS_STOP_USER);
-                }
-                break;
-            default:
-                /* 对时/低功耗等由后续阶段处理 */
-                break;
+    if (ringbuf_pop(&s_evt_q, &ev)) {
+        switch ((app_event_t)ev) {
+        case APP_EV_HALL_FAULT:
+            /* 机械故障：转入一级报警停止，中止大剂量 */
+            state_machine_transit(EV_ALERT_L1);
+            bolus_scheduler_stop(BOLUS_STOP_ALERT_L1);
+            basal_scheduler_pause();
+            break;
+        case APP_EV_FILL_WAKE:
+            state_machine_transit(EV_FILL_WAKE);
+            break;
+        case APP_EV_PIN_IN:
+            state_machine_transit(EV_APPLY_START);
+            break;
+        case APP_EV_LOCK:
+            state_machine_transit(EV_LOCK_DONE);
+            break;
+        case APP_EV_ADC_LOW:
+            beeper_alert(ALERT_LEVEL_2);
+            break;
+        case APP_EV_TIMER_3MIN:
+            /* 基础率 3 分钟槽输注 */
+            pump_app_basal_tick();
+            break;
+        case APP_EV_START_INFUSE:
+            if (state_machine_transit(EV_START_INFUSE)) {
+                basal_scheduler_start();
             }
-        } else {
-            /* 低频轮询：电池/蜂鸣/报警 + 大剂量服务 + 上报刷新 */
-            adc_battery_poll();
-            beeper_tick(50u);
-            alarm_app_tick();           /* 分级报警蜂鸣驱动（FW-D4） */
-            pump_app_service_bolus();
-            pump_app_flush_reports();
+            break;
+        case APP_EV_PAUSE:
+            if (state_machine_transit(EV_PAUSE)) {
+                basal_scheduler_pause();
+                bolus_scheduler_stop(BOLUS_STOP_USER);
+            }
+            break;
+        case APP_EV_RESUME:
+            if (state_machine_transit(EV_RESUME)) {
+                basal_scheduler_resume();
+            }
+            break;
+        case APP_EV_ABANDON:
+            if (state_machine_transit(EV_ABANDON)) {
+                basal_scheduler_pause();
+                bolus_scheduler_stop(BOLUS_STOP_USER);
+            }
+            break;
+        default:
+            break;
         }
+    } else {
+        /* 无可处理事件：低频轮询：电池/蜂鸣/报警 + 大剂量服务 + 上报刷新 */
+        adc_battery_poll();
+        beeper_tick(50u);
+        alarm_app_tick();           /* 分级报警蜂鸣驱动（FW-D4） */
+        pump_app_service_bolus();
+        pump_app_flush_reports();
+    }
+}
+
+void pump_app_run(void)
+{
+    for (;;) {
+        pump_app_process_once();
     }
 }
