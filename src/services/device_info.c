@@ -35,7 +35,7 @@ const factory_info_t *device_info_get(void)
 }
 
 /*
- * RPT_FACTORY(0x86) payload 打包。
+ * IEEE_RPT_FACTORY(0x84) payload 打包。
  * 顺序固定（与接口契约 §4.3 一致）：
  *   model(5) serial(11) prod_batch(11) expiry(9) factory(3)
  *   mech_model(4) mech_vendor(4) mech_batch(9)

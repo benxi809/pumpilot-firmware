@@ -249,23 +249,24 @@ static void test_bolus_scheduler(void)
     }
 }
 
-/* ============ FW-D3：IEEE11073 agent 测试 ============ */
-/* 构造一条命令帧（CMD|op_id|len|payload|CRC，小端） */
+/* ============ FW-D3：IEEE11073 agent 测试（0x11 0x73 文档帧） ============ */
+/* 构造一条 0x11 0x73 文档命令帧：
+ *   11 73 | 01 | cmd | opId(LE4) | payload | crc(LE2)
+ */
 static uint16_t build_cmd(uint8_t *buf, uint8_t cmd, uint32_t op_id,
                           const uint8_t *payload, uint16_t plen)
 {
     uint16_t i;
-    buf[0] = cmd;
-    buf[1] = (uint8_t)op_id; buf[2] = (uint8_t)(op_id >> 8);
-    buf[3] = (uint8_t)(op_id >> 16); buf[4] = (uint8_t)(op_id >> 24);
-    buf[5] = (uint8_t)plen; buf[6] = (uint8_t)(plen >> 8);
-    for (i = 0; i < plen; ++i) buf[7 + i] = payload[i];
+    buf[0] = 0x11; buf[1] = 0x73; buf[2] = 0x01; buf[3] = cmd;
+    buf[4] = (uint8_t)op_id; buf[5] = (uint8_t)(op_id >> 8);
+    buf[6] = (uint8_t)(op_id >> 16); buf[7] = (uint8_t)(op_id >> 24);
+    for (i = 0; i < plen; ++i) buf[8 + i] = payload[i];
     {
-        uint16_t crc = crc16_ccitt(buf, 7 + plen);
-        buf[7 + plen] = (uint8_t)crc;
-        buf[8 + plen] = (uint8_t)(crc >> 8);
+        uint16_t crc = crc16_ccitt(buf, (size_t)(8 + plen));
+        buf[8 + plen] = (uint8_t)crc;
+        buf[9 + plen] = (uint8_t)(crc >> 8);
     }
-    return (uint16_t)(7 + plen + 2);
+    return (uint16_t)(8 + plen + 2);
 }
 
 static void test_ieee11073(void)
@@ -273,83 +274,148 @@ static void test_ieee11073(void)
     printf("[IEEE11073]\n");
     ieee11073_init();
 
-    /* 上报帧构建 + CRC 校验 */
+    /* 上报帧构建 + CRC 校验：11 73 | 02 | rpt | payload... | crc
+     * 3 字节载荷 → 总长 4+3+2 = 9 */
     {
         uint8_t f[IEEE11073_FRAME_MAX];
-        int n = ieee11073_build_report(RPT_STATUS, (const uint8_t[]){3, 0xE8, 0x07}, 3, f);
-        CHECK(n == 10, "RPT frame len 10 (7 hdr + 3 pl + 2 crc)");
-        CHECK(f[0] == RPT_STATUS, "RPT type 0x81");
-        /* 校验整帧 CRC（不含 CRC 两字节） */
+        int n = ieee11073_build_report(IEEE_RPT_MED, (const uint8_t[]){1, 0, 0, 0x80}, 4, f);
+        CHECK(n == 10, "RPT frame len 10 (4 hdr + 4 pl + 2 crc)");
+        CHECK(f[0] == 0x11 && f[1] == 0x73, "sync 11 73");
+        CHECK(f[2] == 0x02, "msgtype 0x02");
+        CHECK(f[3] == IEEE_RPT_MED, "rpt type 0x83");
+        /* 校验整帧 CRC（从首字节到 payload 末，不含 CRC 两字节） */
         {
             uint16_t len = (uint16_t)(n - 2);
             uint16_t crc = crc16_ccitt(f, len);
-            uint16_t crcRd = (uint16_t)(f[len] | (f[len+1] << 8));
+            uint16_t crcRd = (uint16_t)((uint16_t)f[len] | ((uint16_t)f[len+1] << 8));
             CHECK(crc == crcRd, "RPT frame CRC valid");
         }
     }
 
-    /* CMD_SET_TIME 命令：构造并分发 → 返回0 */
+    /* 结合 CONNECT：未绑定时非 CONNECT 命令一律 3004 拒绝 (gate) */
     {
         uint8_t b[32];
-        uint16_t n = build_cmd(b, CMD_SET_TIME, 0x01, (const uint8_t[]){0}, 0);
-        CHECK(ieee11073_on_data(b, n) == 0, "CMD_SET_TIME accepted");
-        CHECK(ieee11073_has_pending(), "result pending");
-        /* 取出 RPT_RESULT */
-        uint8_t out[256]; uint16_t ol;
+        uint16_t n = build_cmd(b, IEEE_CMD_SET_CLOCK, 0x01, (const uint8_t[]){0}, 0);
+        CHECK(ieee11073_on_data(b, n) == 0, "unbound SET_CLOCK handler returns 0");
+        CHECK(ieee11073_has_pending(), "gate result pending");
+        uint8_t out[64]; uint16_t ol;
         CHECK(ieee11073_get_pending(out, &ol), "get pending");
-        CHECK(ol == 12 && out[0] == RPT_RESULT, "result frame 0x87 len 12");
+        /* 帧: 11 73 02 85 | opId(4)+cmd(1)+result(u16 LE)=3004 → 总长 4+7+2=13 */
+        CHECK(ol == 13, "gate confirm frame len 13");
+        CHECK(out[0] == 0x11 && out[1] == 0x73 && out[2] == 0x02, "gate frame hdr 11 73 02");
+        CHECK(out[3] == IEEE_RPT_CONFIRM, "gate rpt=0x85");
+        CHECK(out[4]==0x01 && out[5]==0x00 && out[6]==0x00 && out[7]==0x00, "opId LE");
+        CHECK(out[8] == IEEE_CMD_SET_CLOCK, "cmd echoed");
+        uint16_t code = out[9] | (uint16_t)(out[10] << 8);
+        CHECK(code == 3004u, "result u16 LE == 3004 (unauthorized)");
     }
 
-    /* 错误 CRC → 拒绝 */
+    /* CONNECT 成功 → bound=true, 回执 result=0 */
+    {
+        uint8_t pwd[8];
+        const factory_info_t *fi = device_info_get();
+        size_t pwlen = strlen(fi->bt_password);
+        bool use_known = (pwlen <= sizeof pwd);
+        const char *known = use_known ? fi->bt_password : "PUMP1234";
+        memcpy(pwd, known, sizeof pwd);
+        size_t plen2 = (use_known) ? pwlen : 8u;
+        uint8_t b[64];
+        uint16_t n = build_cmd(b, IEEE_CMD_CONNECT, 0xABCDu, pwd, (uint16_t)plen2);
+        CHECK(ieee11073_on_data(b, n) == 0, "CONNECT accepted");
+        CHECK(ieee11073_is_bound(), "bound after CONNECT");
+        CHECK(ieee11073_has_pending(), "CONNECT result pending");
+        uint8_t out[64]; uint16_t ol;
+        CHECK(ieee11073_get_pending(out, &ol), "get connect pending");
+        CHECK(out[3] == IEEE_RPT_CONFIRM, "rpt=0x85 in connect confirm");
+        /* opId = out[4..7] LE */
+        uint32_t opid = (uint32_t)out[4] | ((uint32_t)out[5] << 8)
+                      | ((uint32_t)out[6] << 16) | ((uint32_t)out[7] << 24);
+        CHECK(opid == 0xABCDu, "opId echoed");
+        CHECK(out[8] == IEEE_CMD_CONNECT && out[9] == 0 && out[10] == 0,
+              "connect cmd=0x01 result=0 (u16LE)");
+    }
+
+    /* 错误 CRC → 回 CRC_ERROR (2)，仍有收到 cmd (SET_CLOCK) */
     {
         uint8_t b[32];
-        uint16_t n = build_cmd(b, CMD_SET_TIME, 0x02, (const uint8_t[]){0}, 0);
+        uint16_t n = build_cmd(b, IEEE_CMD_SET_CLOCK, 0x02, 0, 0);
         b[n-1] ^= 0xFF; /* 破坏 CRC */
         CHECK(ieee11073_on_data(b, n) == CMD_RESULT_CRC_ERROR, "bad CRC rejected");
+        uint8_t out[64]; uint16_t ol;
+        if (ieee11073_get_pending(out, &ol)) {
+            CHECK(out[3] == IEEE_RPT_CONFIRM, "crc err rpt=0x85");
+            uint16_t code = out[9] | (uint16_t)(out[10] << 8);
+            CHECK(code == CMD_RESULT_CRC_ERROR, "crc err result=2");
+        }
     }
 
-    /* CMD_DELIVER_BOLUS → 启动大剂量；幂等拒绝重复 op_id */
+    /* SET_BASAL_PROFILE (绑后，payload 含 profile_id + 48×f32) */
     {
-        uint8_t pl[8];
-        uint8_t b[32];
-        uint16_t n;
-        bolus_scheduler_init();
-        ieee11073_init(); /* 清 pending + 幂等历史 */
-        /* payload: type(1)+dose(4)+ext(2)+ratio(1) = 8 */
-        pl[0] = 0; /* fast */
-        /* dose 1.0 IU = 0x3F800000 小端 */
-        pl[1]=0; pl[2]=0; pl[3]=0x80; pl[4]=0x3F;
-        pl[5]=0; pl[6]=0; /* ext 0 */
-        pl[7]=0; /* ratio 0 */
-        n = build_cmd(b, CMD_DELIVER_BOLUS, 0x10, pl, 8);
-        /* 第一次：启动 */
-        CHECK(ieee11073_on_data(b, n) == 0, "first DELIVER_BOLUS accepted");
-        CHECK(bolus_scheduler_busy(), "DELIVER_BOLUS -> bolus running");
-        /* 幂等：同 op_id 重发 → 返回 OPID_DUP，不重启 */
-        CHECK(ieee11073_on_data(b, n) == CMD_RESULT_OPID_DUP,
-              "dup op_id -> OPID_DUP (idempotent)");
-    }
-
-    /* CMD_SET_BASAL：下发 48 段 */
-    {
-        uint8_t pl[48*4];
+        uint8_t pl[1 + 48*4];
         uint8_t b[256];
         uint16_t i, n;
         float t[PUMP_BASAL_SEG_COUNT];
+        pl[0] = 1; /* profile_id */
         for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) t[i] = 1.0f;
         for (i = 0; i < PUMP_BASAL_SEG_COUNT; ++i) {
-            memcpy(pl + i*4, &t[i], 4); /* 本机 little-endian */
+            memcpy(pl + 1 + i*4, &t[i], 4);
         }
-        n = build_cmd(b, CMD_SET_BASAL, 0x20, pl, sizeof pl);
-        CHECK(ieee11073_on_data(b, n) == 0, "CMD_SET_BASAL accepted");
+        n = build_cmd(b, IEEE_CMD_SET_BASAL_PROF, 0x20, pl, sizeof pl);
+        CHECK(ieee11073_on_data(b, n) == 0, "SET_BASAL_PROF accepted");
         CHECK(basal_scheduler_get_seg_rate(0) == 1.0f, "basal table loaded via BLE");
+        CHECK(ieee11073_has_pending(), "basal result pending");
+        uint8_t out[64]; uint16_t ol;
+        if (ieee11073_get_pending(out, &ol)) {
+            uint16_t code = out[9] | (uint16_t)(out[10] << 8);
+            CHECK(code == CMD_RESULT_OK, "basal confirm result=0");
+        }
+    }
+
+    /* SET_BOLUS → 启动大剂量；幂等拒绝重复 op_id */
+    {
+        uint8_t pl[8];
+        uint8_t b[64];
+        uint16_t n;
+        bolus_scheduler_init();
+        ieee11073_init(); /* 清 pending + 幂等历史 + 绑定态 */
+        /* 需先 reconnect → 绑定 */
+        {
+            uint8_t pwd[8];
+            const factory_info_t *fi = device_info_get();
+            size_t ln = strlen(fi->bt_password);
+            memcpy(pwd, fi->bt_password, ln > 8 ? 8 : ln);
+            uint8_t bc[64];
+            uint16_t n2 = build_cmd(bc, IEEE_CMD_CONNECT, 0xCCC1u, pwd, (uint16_t)ln);
+            ieee11073_on_data(bc, n2);
+        }
+        pl[0] = 0; /* fast */
+        pl[1]=0; pl[2]=0; pl[3]=0x80; pl[4]=0x3F; /* dose 1.0 IU */
+        pl[5]=0; pl[6]=0; /* ext 0 */
+        pl[7]=0; /* ratio 0 */
+        n = build_cmd(b, IEEE_CMD_SET_BOLUS, 0x10, pl, 8);
+        uint8_t out[64]; uint16_t ol;
+        /* 第一次：启动 */
+        CHECK(ieee11073_on_data(b, n) == 0, "first SET_BOLUS accepted");
+        CHECK(bolus_scheduler_busy(), "SET_BOLUS -> bolus running");
+        /* 幂等：同 op_id 重发 → 返回 OPID_DUP，不重启 */
+        CHECK(ieee11073_on_data(b, n) == CMD_RESULT_OPID_DUP,
+              "dup op_id -> OPID_DUP (idempotent)");
+        if (ieee11073_has_pending() && ieee11073_get_pending(out, &ol)) {
+            uint16_t code = out[9] | (uint16_t)(out[10] << 8);
+            CHECK(code == CMD_RESULT_OPID_DUP, "dup result=3");
+        }
     }
 
     /* 鉴权绑定 */
     ieee11073_init();
     CHECK(!ieee11073_is_bound(), "not bound initially");
     CHECK(!ieee11073_auth_bind_pwd((const uint8_t*)"", 0), "empty pwd rejected");
-    CHECK(ieee11073_auth_bind_pwd((const uint8_t*)"123456", 6), "pwd accepted");
+    {
+        const factory_info_t *fi = device_info_get();
+        size_t ln = strlen(fi->bt_password);
+        uint8_t pwd[8]; memcpy(pwd, fi->bt_password, ln > 8 ? 8 : ln);
+        CHECK(ieee11073_auth_bind_pwd(pwd, (uint16_t)ln), "pwd accepted");
+    }
     CHECK(ieee11073_is_bound(), "bound after auth");
 }
 

@@ -44,15 +44,18 @@ static void on_hall_fault(void)
 }
 
 /* ---- FW-D4 报警桥接 ---- */
-/* 报警上报：RPT_ALERT(0x84)，payload = mask(2 LE) + level(1) */
+/* 报警上报：IEEE_RPT_ALERT(0x81)，
+ * payload = level(1) + alarm_type(1) + 文本(0..N)
+ * 这里沿用内部分级信息打包：level 在前，type 由 mask 低位推导（0..5 一级/6..7 二级/8..9 三级
+ * → 直接映射 §10 报警码并不准确 —— 先框架保留 mask 低字节做 type 占位）。 */
 static void on_alarm_report(uint16_t mask, alert_level_t level)
 {
     uint8_t pl[3];
-    pl[0] = (uint8_t)(mask & 0xFF);
-    pl[1] = (uint8_t)((mask >> 8) & 0xFF);
-    pl[2] = (uint8_t)level;
+    pl[0] = (uint8_t)level;                    /* level(1) */
+    pl[1] = (uint8_t)(mask & 0xFF);            /* alarm_type 低字节(占位) */
+    pl[2] = (uint8_t)((mask >> 8) & 0xFF);     /* 次级 */
     uint8_t f[IEEE11073_FRAME_MAX];
-    int n = ieee11073_build_report(RPT_ALERT, pl, sizeof(pl), f);
+    int n = ieee11073_build_report(IEEE_RPT_ALERT, pl, sizeof(pl), f);
     if (n > 0)
         ble_service_notify(f, (uint16_t)n);
 }

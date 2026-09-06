@@ -227,6 +227,8 @@ bool hal_flash_read_factory(factory_info_t *out)
     memcpy(out->model, "RP10", 4);
     strncpy(out->serial, "AB12345678", sizeof(out->serial)-1);
     out->serial[sizeof(out->serial)-1] = 0;
+    strncpy(out->bt_password, "PUMP1234", sizeof(out->bt_password)-1);  // ← 新增：8位默认密码
+    out->bt_password[sizeof(out->bt_password)-1] = 0;
     strncpy(out->mcu_model, "nRF52832", sizeof(out->mcu_model)-1);
     out->mcu_model[sizeof(out->mcu_model)-1] = 0;
     strncpy(out->fw_version, "0.2.0", sizeof(out->fw_version)-1);

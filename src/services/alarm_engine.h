@@ -82,7 +82,7 @@ void     alarm_engine_check(const alarm_input_t *in);
 /* 查询某位是否活跃 */
 bool     alarm_engine_is_active(uint16_t bit);
 
-/* 自上次调用后是否有新产生的报警（用于立即上报 RPT_ALERT） */
+/* 自上次调用后是否有新产生的报警（用于立即上报 IEEE_RPT_ALERT 0x81） */
 bool     alarm_engine_take_new(void);
 
 /* 当前活跃报警位掩码 */

@@ -23,7 +23,7 @@ extern "C" {
 /* 蜂鸣驱动注入（底层由 beeper.c 实现，host 测试可 mock） */
 typedef void (*alarm_beeper_fn)(alert_level_t level, bool active);
 
-/* 上报注入（底层经 ieee11073 → ble_service notiry RPT_ALERT） */
+/* 上报注入（底层经 ieee11073 → ble_service notify IEEE_RPT_ALERT） */
 typedef void (*alarm_report_fn)(uint16_t active_mask, alert_level_t level);
 
 typedef struct {

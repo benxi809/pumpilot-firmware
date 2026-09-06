@@ -23,7 +23,7 @@ extern "C" {
 void   device_info_init(const factory_info_t *fi);
 const factory_info_t *device_info_get(void);
 
-/* 上报负载：将出厂信息打包为 RPT_FACTORY payload；返回长度 */
+/* 上报负载：将出厂信息打包为 IEEE_RPT_FACTORY(0x84) payload；返回长度 */
 uint16_t device_info_export(uint8_t *buf, uint16_t max);
 
 #ifdef __cplusplus

@@ -11,8 +11,8 @@ CC      := gcc
 CFLAGS  := -std=c11 -Wall -Wextra -O0 -g
 INCLUDES := -Isrc -Isrc/app -Isrc/services -Isrc/drivers -Isrc/hal -Isrc/config -Ilib -Itests
 
-TEST_SRCS := \
-    tests/test_pulse_calc.c \
+# 被测固件源（不含各测试 main；两个测试二进制共享）
+UT_SRCS := \
     tests/mock_hal.c \
     lib/crc16.c \
     lib/ringbuf.c \
@@ -32,17 +32,29 @@ TEST_SRCS := \
     src/drivers/adc_battery.c \
     src/drivers/beeper.c
 
+TEST_SRCS := tests/test_pulse_calc.c $(UT_SRCS)
+
+# IEEE11073 0x11/0x73 字节级对齐测试（独立 main，与上面同源链接）
+ALIGN_SRCS := tests/test_ieee11073_align.c $(UT_SRCS)
+
 TEST_BIN := build/fw_tests
+ALIGN_BIN := build/fw_align
 
 .PHONY: all test clean arm
 
 all: test
 
-test: $(TEST_BIN)
-	@echo "--- running ---"
+test: $(TEST_BIN) $(ALIGN_BIN)
+	@echo "--- running (legacy test_pulse_calc) ---"
 	./$(TEST_BIN)
+	@echo "--- running (ieee11073 0x11/0x73 align) ---"
+	./$(ALIGN_BIN)
 
 $(TEST_BIN): $(TEST_SRCS)
+	@mkdir -p build
+	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@
+
+$(ALIGN_BIN): $(ALIGN_SRCS)
 	@mkdir -p build
 	$(CC) $(CFLAGS) $(INCLUDES) $^ -o $@
 
